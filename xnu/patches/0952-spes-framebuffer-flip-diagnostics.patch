@@ -1,0 +1,70 @@
+From: topaz
+Subject: [PATCH] spes: framebuffer flip diagnostics, sweetfb_flip=0
+
+On the Redmi Note 11 (spes, SM6225 like topaz) the kernel booted with its
+RAM at 0xb0000000 (below 4 GiB) and the panel kept the last frame after
+"SWEET FB: MDP VIG0 ... direct scanout ready": with RAM below 4 GiB the
+flip buffers and the console shadow are made, the console moves to the
+shadow and only a vsync shows it again. With its RAM above 4 GiB
+(0x1_00000000) the same kernel went on to "cannot mount root". A shim test
+on spes moved VIG0 to another buffer with CTL0's flush (0x20001), as
+scanFrom() does, and the panel showed it.
+
+- sweetfb_flip=0 keeps the console on ABL's frame (no flip buffers, no
+  shadow), as when there is no RAM below 4 GiB for them.
+- Lines that say what was made and when the console moves, and the first
+  and the 600th vsync, to tell a stopped vsync from a stopped kernel.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 1d3ee17..703e6ed 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -418,14 +418,26 @@ AppleCLCD::start(IOService *provider)
+ 		    fBootSrc, fBootStride);
+ 		sweet_scanout_set_geometry(fWidth, fHeight, fLogicalW, fLogicalH);
+ 		vm_size_t fsz = (vm_size_t)fRowBytes * fHeight;
+-		for (int i = 0; i < 2; i++) {
++		/*
++		 * spes (Redmi Note 11): with kernel RAM below 4 GiB the console went to the shadow
++		 * below and the panel showed nothing after this point. sweetfb_flip=0 keeps the
++		 * console on ABL's frame (as when there is no RAM below 4 GiB for these buffers).
++		 */
++		uint32_t flip = 1;
++		(void)PE_parse_boot_argn("sweetfb_flip", &flip, sizeof(flip));
++		for (int i = 0; flip != 0 && i < 2; i++) {
+ 			fFlip[i] = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 			    kIODirectionInOut | kIOMemoryPhysicallyContiguous, fsz, 0x00000000fffff000ull);
+ 			fFlipPhys[i] = fFlip[i] ? fFlip[i]->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+ 		}
+-		fFadeOrig = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, fsz, page_size);
+-		fCons = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, fsz, 0x00000000fffff000ull);
++		if (flip != 0) {
++			fFadeOrig = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, fsz, page_size);
++			fCons = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++			    kIODirectionInOut | kIOMemoryPhysicallyContiguous, fsz, 0x00000000fffff000ull);
++		}
++		IOLog("SWEET FB: flip buffers %#llx %#llx, console shadow %#llx%s\n", (unsigned long long)fFlipPhys[0],
++		    (unsigned long long)fFlipPhys[1], fCons ? (unsigned long long)fCons->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0ull,
++		    flip ? "" : " (sweetfb_flip=0)");
+ 		if (fFlip[0] == NULL || fFlip[1] == NULL || fFadeOrig == NULL) {
+ 			OSSafeReleaseNULL(fFlip[0]);
+ 			OSSafeReleaseNULL(fFlip[1]);
+@@ -436,6 +448,7 @@ AppleCLCD::start(IOService *provider)
+ 			uint8_t *c = (uint8_t *)fCons->getBytesNoCopy();
+ 			memcpy(c, (const void *)fPixels, fsz);  /* keep what the console drew */
+ 			sweet_dcache_clean((vm_offset_t)(uintptr_t)c, (unsigned)fsz);   /* for panics */
++			IOLog("SWEET FB: console moves to the shadow; the next lines show only once a vsync flips them\n");
+ 			fConsPhys = fCons->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
+ 			sweet_cons_fb = this;
+ 			sweet_console_show_hook = sweet_cons_show;
+@@ -484,6 +497,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	sweet_fps_tick = now;
++	if (count == 1 || count == 600) {
++		IOLog("SWEET FB: vsync %llu\n", count);     /* (spes: is the timer that shows the console running) */
++	}
+ 	/*
+ 	 * What QuartzCore reads (darwin-redwood MiniIOMobileFramebuffer): three 64-bit numbers as six
+ 	 * halves -- the time of this refresh, the time it was presented, a counter. The counter came
