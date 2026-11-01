@@ -1,0 +1,293 @@
+From: topaz
+Subject: [PATCH] topaz: RedwoodGPU for Turnip (Vulkan), after hakios-arm64e-dada
+
+Turnip's darwin kernel backend (userland/vulkan, Mesa from
+hakios-arm64e-dada's gpu2) reaches the GPU through RedwoodGPU's msm
+interface, as freedreno does. What it uses beyond freedreno, from
+hakios-arm64e-dada's RedwoodGPU.cpp:
+
+- GPU_SUBMIT_BO_TRACK (0x8000) on a submission's buffer: the transport
+  names every IOSurface it has imported in each submission, so the
+  display waits for the GPU before it shows one (surface->drawn); such a
+  buffer is not pushed out of the cache here.
+- kRedwoodHost (0x7c): pages of the program's own memory as a buffer
+  (Metal's no-copy buffers; the transport asks only with
+  TU_DARWIN_HOST_IMPORT=1). Wired, mapped into the kernel for the cache
+  pushes, pushed out before every submission, never kept for another
+  buffer. Refused in pass-through (gpu_identity=1, the default): the GPU's
+  address is the physical one there and a program's pages are not one
+  contiguous run.
+- kRedwoodGPUWorked (0x7d): redwood_gpu_worked() for a program (zeros on
+  topaz until TopazAdreno times submissions).
+- MSM_PARAM_UCHE_TRAP_BASE (0x14): the value hw_init_regs() programs
+  (Turnip's fallback is the same, now it is said).
+---
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index a4e5569..b968254 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -24,6 +24,11 @@
+  * them. Linux hands such memory around as file descriptors; here it has a name already. That
+  * memory is ordinary, cached memory, which everybody else reads and writes as such.
+  *
++ * topaz: Turnip (Mesa's Vulkan driver, userland/vulkan) speaks the same interface through its
++ * darwin backend's RedwoodGPU transport (from hakios-arm64e-dada, tu_knl_darwin_redwood.h): it
++ * names every IOSurface it has imported in each submission with GPU_SUBMIT_BO_TRACK, and may ask
++ * for pages of its own memory as a buffer (kRedwoodHost, with the SMMU translating only).
++ *
+  * Not here yet: interrupts (waiting is asking again five times a millisecond), more than one
+  * program's worth of care (every client's buffers are in the one address space; a client that
+  * goes takes its own away), recovery of a GPU that has stopped answering (it is reported, see
+@@ -90,6 +95,8 @@ enum {
+ 	kMsmSubmitQueueNew      = 0x4a,
+ 	kMsmSubmitQueueClose    = 0x4b,
+ 	kMsmSubmitQueueQuery    = 0x4c,
++	kRedwoodHost            = 0x7c,         /* ours: pages of the caller's own memory as a buffer (Metal's no-copy buffers) */
++	kRedwoodGPUWorked       = 0x7d,         /* ours: how long the 3D core itself has worked, and on how many */
+ 	kRedwoodSurface         = 0x7e,         /* ours: an IOSurface's memory as a buffer */
+ 	kRedwoodShow            = 0x7f,         /* ours: pixels of the caller's onto the panel, to see a test's result */
+ };
+@@ -149,6 +156,29 @@ struct msm_submitqueue_query {
+ struct drm_gem_close {
+ 	uint32_t handle, pad;
+ };
++/*
++ * kRedwoodHost: `bytes` of the caller's memory from `address` (both 4 KB aligned) as a buffer: the pages are wired and entered
++ * into the GPU's address space for as long as the buffer is there, and pushed out of the cache before every submission that
++ * names the buffer (the memory is the program's ordinary, cached memory). Back: the buffer. topaz: only with gpu_identity=0;
++ * in pass-through the GPU's address is the physical one, and a program's pages are not one contiguous run.
++ */
++struct redwood_host {
++	uint64_t address;
++	uint64_t bytes;
++	uint32_t handle;
++	uint32_t flags;                         /* MSM_BO_GPU_READONLY, or 0 */
++};
++#define GPU_BUFFER_HOST         0x40000000u     /* in gpu_buffer.flags: a kRedwoodHost buffer (never kept for another) */
++
++/*
++ * kRedwoodGPUWorked: what redwood_gpu_worked() says, for a program that times the GPU with its own clock. It resets what it
++ * reports (as the five-second line in submit() does). topaz: TopazAdreno.cpp does not time submissions yet: all zero.
++ */
++struct redwood_worked {
++	uint64_t microseconds;
++	uint32_t submissions;
++	uint32_t by[7];
++};
+ struct redwood_surface {
+ 	uint32_t surface;                       /* the IOSurface's ID */
+ 	uint32_t handle;                        /* kRedwoodDescribe: no buffer is wanted; else, back: the buffer, */
+@@ -176,6 +206,8 @@ struct redwood_show {
+ #define GPU_BUFFER_MAX          (256u << 20)
+ #define GPU_SUBMIT_CMDS         128
+ #define GPU_SUBMIT_BOS          8192
++#define GPU_SUBMIT_BO_TRACK     0x8000u         /* a submission's buffer flag (Turnip's darwin transport): named for the surface's
++                                                 * "drawn" mark only, not to be pushed out of the cache here (the plugin does) */
+ #define GPU_PATIENCE_MS         5000            /* for a buffer or a submission that somebody waits for without a limit */
+ #define GPU_ASK_AGAIN_US        200             /* while waiting for the core: how long between two looks at how far it is */
+ #define GPU_PUSH_AGAIN_MS       4               /* a surface is pushed out of the cache again for a submission this long after the last */
+@@ -365,6 +397,8 @@ struct gpu_buffer {
+ 	uint64_t                        pushed;         /* ... and when that was */
+ 	bool                            seen;           /* by the program: mapped, and from then on written by it */
+ 	uint32_t                        fence;          /* the last submission that names it (0: none has) */
++	uint64_t                        flushSize;      /* what of it is pushed out of the cache, when not all (0: all) */
++	IOMemoryMap *                   map;            /* a kRedwoodHost buffer's pages in the kernel (for the cache pushes) */
+ };
+ 
+ /*
+@@ -376,6 +410,7 @@ struct gpu_buffer {
+  */
+ struct gpu_left {
+ 	IOMemoryDescriptor *            memory;
++	IOMemoryMap *                   map;
+ 	SweetSurface *                  surface;
+ 	uint64_t                        address, size;
+ 	uint32_t                        fence, flags;
+@@ -431,6 +466,7 @@ class RedwoodGPUUserClient : public IOUserClient
+ 	void reap(void);
+ 	IOReturn gemNew(struct msm_gem_new * request);
+ 	IOReturn surfaceBuffer(struct redwood_surface * request);
++	IOReturn hostBuffer(struct redwood_host * request);
+ 	IOReturn gemInfo(struct msm_gem_info * request);
+ 	IOReturn submit(struct msm_gem_submit * request);
+ 	IOReturn show(const struct redwood_show * request);
+@@ -493,6 +529,7 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+ 		struct gpu_left * left = &fLeft[fLeftCount++];
+ 
+ 		left->memory = b->memory;
++		left->map = b->map;
+ 		left->surface = b->surface;
+ 		left->address = b->address;
+ 		left->size = b->size;
+@@ -519,14 +556,18 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+ 				redwood_gpu_address_free(b->address, b->size);
+ 			}
+ 		}
++		if (b->map != NULL) {
++			b->map->release();
++		}
+ 		if (b->memory != NULL) {
+-			b->memory->release();
++			b->memory->release();           /* (a kRedwoodHost buffer's pages are unwired as it goes) */
+ 		}
+ 		if (b->surface != NULL) {
+ 			b->surface->release();
+ 		}
+ 	}
+ 	b->memory = NULL;
++	b->map = NULL;
+ 	b->surface = NULL;
+ 	fBufferCount--;
+ 	fBufferBytes -= b->size;
+@@ -552,6 +593,9 @@ RedwoodGPUUserClient::reap(void)
+ 				redwood_gpu_address_free(left->address, left->size);
+ 			}
+ 		}
++		if (left->map != NULL) {
++			left->map->release();
++		}
+ 		if (left->memory != NULL) {
+ 			left->memory->release();
+ 		}
+@@ -669,6 +713,8 @@ RedwoodGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint
+ 	b->pushed = 0;
+ 	b->seen = false;
+ 	b->fence = 0;
++	b->flushSize = 0;
++	b->map = NULL;
+ 	b->surface = NULL;
+ 	fBufferCount++;
+ 	fBufferBytes += size;
+@@ -697,6 +743,9 @@ RedwoodGPUUserClient::keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64
+ {
+ 	struct gpu_kept * place = NULL;
+ 
++	if (flags & GPU_BUFFER_HOST) {
++		return false;                   /* the program's own pages: never another's */
++	}
+ 	if (gGPUKeep == 0 || size < GPU_KEEP_FROM || size > GPU_KEPT_BYTES / 4 || memory == NULL ||
+ 	    (kernel == NULL && OSDynamicCast(IOBufferMemoryDescriptor, memory) == NULL)) {
+ 		return false;
+@@ -977,6 +1026,61 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 	return kIOReturnSuccess;
+ }
+ 
++/* Pages of the program's own memory as a buffer (hakios-arm64e-dada's RedwoodGPU, for Metal's no-copy buffers). */
++IOReturn
++RedwoodGPUUserClient::hostBuffer(struct redwood_host * request)
++{
++	const uint64_t start = trunc_page_64(request->address), end = round_page_64(request->address + request->bytes);
++	const uint64_t from = request->address - start, size = (request->bytes + 4095) & ~4095ull;
++	struct gpu_buffer * b;
++	IOMemoryDescriptor * memory;
++	IOReturn ret;
++
++	if (request->bytes == 0 || (request->address & 4095) != 0 || size > GPU_BUFFER_MAX || end <= start) {
++		return kIOReturnBadArgument;
++	}
++	if (redwood_gpu_identity()) {
++		static uint32_t told;
++
++		if (told++ < 4) {
++			IOLog("RedwoodGPU: %llu bytes of a program's own memory as a buffer: not in pass-through (gpu_identity=0 for it)\n",
++			    request->bytes);
++		}
++		return kIOReturnUnsupported;
++	}
++	memory = IOMemoryDescriptor::withAddressRange(start, end - start, kIODirectionInOut, fTask);
++	if (memory == NULL) {
++		return kIOReturnNoMemory;
++	}
++	if ((ret = memory->prepare()) != kIOReturnSuccess) {
++		memory->release();
++		return ret;
++	}
++	IOMemoryMap * map = memory->map(kIOMapAnywhere);       /* the kernel's view, to push the program's writes out of the cache */
++	if (map == NULL) {
++		memory->complete();
++		memory->release();
++		return kIOReturnVMError;
++	}
++	IOLockLock(gGPULock);
++	b = newBuffer(memory, from, size, GPU_BUFFER_HOST | (request->flags & MSM_BO_GPU_READONLY), &request->handle);
++	if (b != NULL) {
++		b->memory = memory;
++		b->map = map;
++		b->kernel = (uint8_t *) map->getVirtualAddress() + from;
++		b->flushSize = request->bytes;
++		b->seen = true;                 /* the program writes it whenever it likes: pushed out for every submission */
++	}
++	IOLockUnlock(gGPULock);
++	if (b == NULL) {
++		map->release();
++		memory->complete();
++		memory->release();
++		return kIOReturnNoMemory;
++	}
++	return kIOReturnSuccess;
++}
++
+ IOReturn
+ RedwoodGPUUserClient::gemInfo(struct msm_gem_info * request)
+ {
+@@ -1042,7 +1146,7 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 	for (uint32_t i = 0; i < request->nr_bos; i++) {
+ 		struct gpu_buffer * b = buffer(bos[i].handle);
+ 
+-		if (b == NULL) {
++		if (b == NULL || (bos[i].flags & GPU_SUBMIT_BO_TRACK)) {
+ 			continue;
+ 		}
+ 		if (b->surface != NULL && b->surface->gpuPool) {
+@@ -1056,11 +1160,11 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 			}
+ 			b->seed = seed;
+ 			b->pushed = began;
+-		} else if (!b->seen || !gGPUCached) {
+-			continue;
++		} else if (!(b->flags & GPU_BUFFER_HOST) && (!b->seen || !gGPUCached)) {
++			continue;               /* (a kRedwoodHost buffer is the program's cached memory: pushed out every time) */
+ 		}
+-		redwood_gpu_to_memory(b->kernel, b->size);
+-		gGPUStat.flushed += b->size;
++		redwood_gpu_to_memory(b->kernel, b->flushSize ? b->flushSize : b->size);
++		gGPUStat.flushed += b->flushSize ? b->flushSize : b->size;
+ 	}
+ 	redwood_gpu_to_memory(NULL, 0);                 /* (and what was written last is in memory: a barrier) */
+ 	gGPUStat.flushing += mach_absolute_time() - began;
+@@ -1233,6 +1337,8 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 		struct drm_gem_close close;
+ 		struct redwood_surface surface;
+ 		struct redwood_show show;
++		struct redwood_host host;
++		struct redwood_worked worked;
+ 	} r;
+ 	size_t size = args->structureInputSize;
+ 	struct gpu_buffer * b;
+@@ -1319,6 +1425,14 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 	case kRedwoodShow:
+ 		ret = show(&r.show);
+ 		break;
++	case kRedwoodHost:
++		ret = hostBuffer(&r.host);
++		break;
++	case kRedwoodGPUWorked:
++		IOLockLock(gGPULock);
++		redwood_gpu_worked(&r.worked.microseconds, &r.worked.submissions, r.worked.by);
++		IOLockUnlock(gGPULock);
++		break;
+ 	default:
+ 		IOLog("RedwoodGPU: request %#x (%zu bytes) is not known here\n", selector, size);
+ 		ret = kIOReturnUnsupported;
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 16da336..50131fa 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -1048,6 +1048,7 @@ redwood_gpu_parameter(uint32_t which, uint64_t *value)
+ 	case 0x10: *value = 13; return true;                    /* HIGHEST_BANK_BIT (a6xx_calc_ubwc_config a610) */
+ 	case 0x12: *value = 7; return true;                     /* UBWC_SWIZZLE */
+ 	case 0x13: *value = 0; return true;                     /* MACROTILE_MODE */
++	case 0x14: *value = 0x1fffffffff000ull; return true;    /* UCHE_TRAP_BASE: as hw_init_regs() programs it (Turnip) */
+ 	default:
+ 		return false;                                   /* VA_START/VA_SIZE: addresses are ours to give */
+ 	}
