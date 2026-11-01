@@ -19,6 +19,12 @@ on:
       piece_mb:
         description: sparse piece size (MiB)
         default: "1024"
+  push:
+    branches: [spes]
+    paths:
+      - ".github/workflows/iosroot.yml"
+      - "tools/mkiosroot.sh"
+      - "tools/sweet-root-tweaks.py"
 
 jobs:
   root:
@@ -27,6 +33,9 @@ jobs:
     env:
       W: /mnt/w
       ROOT_KEY: ${{ secrets.ROOT_KEY }}
+      IPSW_URL: ${{ inputs.ipsw_url || 'https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw' }}
+      ROOT_SIZE: ${{ inputs.size || '16G' }}
+      PIECE_MB: ${{ inputs.piece_mb || '1024' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -51,7 +60,7 @@ jobs:
       - name: IPSW disk images
         run: |
           mkdir -p "$W/ipsw"
-          python3 tools/remotezip.py "${{ inputs.ipsw_url }}" BuildManifest.plist "$W/ipsw"
+          python3 tools/remotezip.py "$IPSW_URL" BuildManifest.plist "$W/ipsw"
           python3 - "$W/ipsw/BuildManifest.plist" > "$W/dmgs" <<'EOF'
           import plistlib, sys
           m = plistlib.load(open(sys.argv[1], 'rb'))
@@ -61,13 +70,13 @@ jobs:
               print(i['Manifest'][k]['Info']['Path'])
           EOF
           cat "$W/dmgs"
-          while read -r d; do python3 tools/remotezip.py "${{ inputs.ipsw_url }}" "$d" "$W/ipsw" | tail -1; done < "$W/dmgs"
+          while read -r d; do python3 tools/remotezip.py "$IPSW_URL" "$d" "$W/ipsw" | tail -1; done < "$W/dmgs"
           ls -l "$W/ipsw"
 
       - name: Root image
         run: |
           mapfile -t d < "$W/dmgs"
-          sudo bash tools/mkiosroot.sh "$W/ipsw/${d[0]}" "$W/ipsw/${d[1]}" "$W/ipsw/${d[2]}" "$W/root.img" "${{ inputs.size }}"
+          sudo bash tools/mkiosroot.sh "$W/ipsw/${d[0]}" "$W/ipsw/${d[1]}" "$W/ipsw/${d[2]}" "$W/root.img" "$ROOT_SIZE"
           rm -rf "$W/ipsw"
           mkdir "$W/m"
           sudo mount -t hfsplus -o loop,force "$W/root.img" "$W/m"
@@ -81,7 +90,7 @@ jobs:
           img2simg "$W/root.img" "$W/root.simg"
           rm "$W/root.img"
           mkdir "$W/out"
-          simg2simg "$W/root.simg" "$W/out/piece" $(( ${{ inputs.piece_mb }} * 1024 * 1024 ))
+          simg2simg "$W/root.simg" "$W/out/piece" $(( $PIECE_MB * 1024 * 1024 ))
           rm "$W/root.simg"
           cd "$W/out"
           for p in $(ls piece.* | sort -t. -k2 -n); do
