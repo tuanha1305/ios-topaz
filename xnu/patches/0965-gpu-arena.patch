@@ -1,0 +1,194 @@
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index b968254..a7fef14 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -349,6 +349,122 @@ RedwoodGPU::start(IOService * provider)
+ 	return true;
+ }
+ 
++/*
++ * spes: boot-arg gpu_arena_mb=N (with gpu_midmem=1). Each buffer made afresh as its own contiguous
++ * run of kernel RAM below 4 GiB took 14-120 ms once the RAM was in pieces (CoreAnimation makes a
++ * screen-sized texture for every blur: the hitches). So one run of N MB is taken here, at boot,
++ * and buffers are cut from it: the same memory (kernel RAM, write-combined), had in microseconds.
++ * When it is full, buffers are made as before.
++ */
++#define GPU_ARENA_UNIT          0x4000ull
++#define GPU_ARENA_RANGES        1024
++static IOBufferMemoryDescriptor * gArena;
++static uint8_t * gArenaKernel;
++static uint64_t gArenaPhys, gArenaSize, gArenaUsed;
++static struct { uint64_t start, size; } gArenaFree[GPU_ARENA_RANGES];
++static unsigned gArenaFreeCount;
++static IOLock * gArenaLock;
++
++static void
++arenaInit(void)
++{
++	uint32_t mb = 0;
++
++	if (!topaz_gpu_midmem() || !PE_parse_boot_argn("gpu_arena_mb", &mb, sizeof(mb)) || mb == 0 || mb > 1024) {
++		return;
++	}
++	gArena = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous | kIOMapWriteCombineCache,
++	    (vm_size_t) mb << 20, 0x00000000fffff000ull);
++	if (gArena == NULL || (gArenaLock = IOLockAlloc()) == NULL) {
++		IOLog("RedwoodGPU: no arena of %u MB\n", mb);
++		OSSafeReleaseNULL(gArena);
++		return;
++	}
++	gArenaKernel = (uint8_t *) gArena->getBytesNoCopy();
++	gArenaPhys = gArena->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++	gArenaSize = (uint64_t) mb << 20;
++	gArenaFree[0].start = 0;
++	gArenaFree[0].size = gArenaSize;
++	gArenaFreeCount = 1;
++	IOLog("RedwoodGPU: arena of %u MB at %#llx\n", mb, gArenaPhys);
++}
++
++/* A buffer cut from the arena, zeroed; NULL when there is no room. */
++static IOMemoryDescriptor *
++arenaTake(uint64_t size, uint8_t ** kernel)
++{
++	uint64_t at = ~0ull;
++
++	if (gArena == NULL) {
++		return NULL;
++	}
++	size = (size + GPU_ARENA_UNIT - 1) & ~(GPU_ARENA_UNIT - 1);
++	IOLockLock(gArenaLock);
++	for (unsigned i = 0; i < gArenaFreeCount; i++) {
++		if (gArenaFree[i].size >= size) {
++			at = gArenaFree[i].start;
++			gArenaFree[i].start += size;
++			gArenaFree[i].size -= size;
++			if (gArenaFree[i].size == 0) {
++				memmove(&gArenaFree[i], &gArenaFree[i + 1], (--gArenaFreeCount - i) * sizeof(gArenaFree[0]));
++			}
++			gArenaUsed += size;
++			break;
++		}
++	}
++	IOLockUnlock(gArenaLock);
++	if (at == ~0ull) {
++		return NULL;
++	}
++	IOMemoryDescriptor * md = IOSubMemoryDescriptor::withSubRange(gArena, at, size, kIODirectionInOut);
++	if (md == NULL) {
++		return NULL;                    /* (the range is lost; it does not happen) */
++	}
++	*kernel = gArenaKernel + at;
++	bzero(*kernel, (size_t) size);
++	return md;
++}
++
++/* If memory was cut from the arena, its range is free again (the caller releases it as before). */
++static void
++arenaGive(IOMemoryDescriptor * memory)
++{
++	IOSubMemoryDescriptor * sub = OSDynamicCast(IOSubMemoryDescriptor, memory);
++
++	if (gArena == NULL || sub == NULL) {
++		return;
++	}
++	uint64_t phys = sub->getPhysicalSegment(0, NULL, kIOMemoryMapperNone), size = sub->getLength();
++	if (phys < gArenaPhys || phys + size > gArenaPhys + gArenaSize) {
++		return;
++	}
++	uint64_t address = phys - gArenaPhys;
++	unsigned at;
++
++	IOLockLock(gArenaLock);
++	for (at = 0; at < gArenaFreeCount && gArenaFree[at].start < address; at++) {
++	}
++	if (at > 0 && gArenaFree[at - 1].start + gArenaFree[at - 1].size == address) {
++		gArenaFree[at - 1].size += size;
++		if (at < gArenaFreeCount && address + size == gArenaFree[at].start) {
++			gArenaFree[at - 1].size += gArenaFree[at].size;
++			memmove(&gArenaFree[at], &gArenaFree[at + 1], (--gArenaFreeCount - at) * sizeof(gArenaFree[0]));
++		}
++	} else if (at < gArenaFreeCount && address + size == gArenaFree[at].start) {
++		gArenaFree[at].start = address;
++		gArenaFree[at].size += size;
++	} else if (gArenaFreeCount < GPU_ARENA_RANGES) {
++		memmove(&gArenaFree[at + 1], &gArenaFree[at], (gArenaFreeCount++ - at) * sizeof(gArenaFree[0]));
++		gArenaFree[at].start = address;
++		gArenaFree[at].size = size;
++	} else {
++		size = 0;                       /* (no room to note it: lost until a reboot) */
++	}
++	gArenaUsed -= size;
++	IOLockUnlock(gArenaLock);
++}
++
+ void
+ RedwoodGPUStart(void)
+ {
+@@ -362,6 +478,7 @@ RedwoodGPUStart(void)
+ 	(void)PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached));
+ 	gGPUCached = cached != 0;
+ 	gGPULock = IOLockAlloc();
++	arenaInit();
+ 	gpu = OSTypeAlloc(RedwoodGPU);
+ 	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
+ 		OSSafeReleaseNULL(gpu);
+@@ -560,6 +677,7 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+ 			b->map->release();
+ 		}
+ 		if (b->memory != NULL) {
++			arenaGive(b->memory);
+ 			b->memory->release();           /* (a kRedwoodHost buffer's pages are unwired as it goes) */
+ 		}
+ 		if (b->surface != NULL) {
+@@ -597,6 +715,7 @@ RedwoodGPUUserClient::reap(void)
+ 			left->map->release();
+ 		}
+ 		if (left->memory != NULL) {
++			arenaGive(left->memory);
+ 			left->memory->release();
+ 		}
+ 		if (left->surface != NULL) {
+@@ -732,6 +851,7 @@ RedwoodGPUUserClient::dropKept(struct gpu_kept * k)
+ 		redwood_gpu_unmap(k->address, k->size);
+ 		redwood_gpu_address_free(k->address, k->size);
+ 	}
++	arenaGive(k->memory);
+ 	k->memory->release();
+ 	k->memory = NULL;
+ 	fKeptBytes -= k->size;
+@@ -831,6 +951,26 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 	IOLockUnlock(gGPULock);
+ 	/* (the memory comes zeroed, and making it write-combined pushes the zeroes out of the cache) */
+ 	if (redwood_gpu_identity()) {
++		/* spes: cut from the arena when there is one (arenaInit()) */
++		uint8_t * cut = NULL;
++		IOMemoryDescriptor * piece = arenaTake(size, &cut);
++		if (piece != NULL) {
++			IOLockLock(gGPULock);
++			b = newBuffer(piece, 0, size, request->flags, &request->handle);
++			if (b != NULL) {
++				b->memory = piece;
++				b->kernel = cut;
++				gGPUStat.made++;
++				gGPUStat.making += mach_absolute_time() - began;
++			}
++			IOLockUnlock(gGPULock);
++			if (b == NULL) {
++				arenaGive(piece);
++				piece->release();
++				return kIOReturnNoMemory;
++			}
++			return kIOReturnSuccess;
++		}
+ 		/* topaz: kernel memory below 4 GiB, contiguous (ADT --midmem gives the kernel such RAM) */
+ 		IOBufferMemoryDescriptor * low = !topaz_gpu_midmem() ? NULL : IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous | kIOMapWriteCombineCache,
+@@ -842,6 +982,7 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 				b->memory = low;
+ 				b->kernel = (uint8_t *) low->getBytesNoCopy();
+ 				gGPUStat.made++;
++				gGPUStat.making += mach_absolute_time() - began;
+ 			}
+ 			IOLockUnlock(gGPULock);
+ 			if (b == NULL) {
