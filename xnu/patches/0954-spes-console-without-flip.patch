@@ -1,0 +1,27 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 703e6ed..c2c8cbe 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -458,6 +458,13 @@ AppleCLCD::start(IOService *provider)
+ 			IOLog("SWEET FB: console double buffered (shadow %#llx)\n", fConsPhys);
+ 		} else {
+ 			OSSafeReleaseNULL(fCons);
++			/*
++			 * spes (sweetfb_flip=0): the console stays in ABL's frame; panics and
++			 * sweetfb_console=1 scan that frame out again.
++			 */
++			fConsPhys = fBootSrc;
++			sweet_cons_fb = this;
++			sweet_console_show_hook = sweet_cons_show;
+ 		}
+ 	}
+ 	uint32_t hz = 10;
+@@ -1332,7 +1339,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 		console_only = 0;
+ 		PE_parse_boot_argn("sweetfb_console", &console_only, sizeof(console_only));
+ 	}
+-	if (console_only > 0 && fConsShown) {
++	if (console_only > 0 && (fConsShown || fCons == NULL)) {
+ 		(void)mask;
+ 		return;
+ 	}
