@@ -1,0 +1,21 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index c240258..2f96be7 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6881,7 +6881,15 @@ void
+ pmap_sync_page_attributes_phys(
+ 	ppnum_t pp)
+ {
+-	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
++	/*
++	 * spes: ptoa, not (pp << PAGE_SHIFT): the 32-bit page number shifted in 32 bits cut RAM above
++	 * 4 GiB (0x13af64000 -> 0x3af64000, phystokv_range panic once Mesa mapped buffers write-combined).
++	 * RAM the kernel does not manage (the GPU pool) is not in the physical aperture: nothing to flush.
++	 */
++	pmap_paddr_t pa = ptoa(pp);
++	if (pa_valid(pa)) {
++		flush_dcache((vm_offset_t) pa, PAGE_SIZE, TRUE);
++	}
+ }
+ 
+ #if CONFIG_COREDUMP
