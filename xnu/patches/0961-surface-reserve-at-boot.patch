@@ -1,0 +1,20 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 0497868..0cc081f 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -680,6 +680,15 @@ IOCoreSurfaceRoot::start(IOService *provider)
+ 		return false;
+ 	}
+ 	sweet_surface_init_lock();
++	/*
++	 * spes: the screen-sized buffers now, while the kernel's RAM is still in one piece. At the
++	 * first surface (backboardd's) not one 12 MB contiguous run was left, and every application's
++	 * screen was read back from the GPU at each frame (the 130-170 ms frames).
++	 */
++	uint32_t gpu_on = 0;
++	if (PE_parse_boot_argn("gpu", &gpu_on, sizeof(gpu_on)) && gpu_on != 0) {
++		sweet_res_fill();
++	}
+ 	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
+ 	registerService();
+ 	IOLog("SWEET SURF: IOCoreSurfaceRoot registered\n");
