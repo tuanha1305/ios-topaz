@@ -1,0 +1,84 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index e17297a..0497868 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -432,6 +432,18 @@ sweet_surface_alloc(void)
+ 	return s;
+ }
+ 
++/* spes: boot-arg sweetsurftrace=1, each step of a create (where a GPU boot hangs) */
++static int sweet_surf_trace = -1;
++#define SURF_TRACE(...) do { \
++	if (sweet_surf_trace < 0) { \
++		uint32_t on = 0; \
++		sweet_surf_trace = PE_parse_boot_argn("sweetsurftrace", &on, sizeof(on)) && on != 0; \
++	} \
++	if (sweet_surf_trace) { \
++		IOLog("SWEET SURF T: " __VA_ARGS__); \
++	} \
++} while (0)
++
+ static bool
+ sweet_surface_publish(SweetSurface *s)
+ {
+@@ -968,7 +980,10 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		return kIOReturnNoMemory;
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
++	SURF_TRACE("props %u keys\n", props->getCount());
+ 	ret = sweet_surface_layout(s, props);
++	SURF_TRACE("layout %ux%u bpr %u size %u -> 0x%x, address %d\n", s->width, s->height, s->bytesPerRow, s->allocSize, ret,
++	    props->getObject("IOSurfaceAddress") != NULL);
+ 	/*
+ 	 * IOSurfaceAddress: a surface around memory the creator has already.
+ 	 * CoreAnimation's GL renderer makes its pictures (applications' icons,
+@@ -1011,13 +1026,16 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		 * a command buffer, read back as addresses (SMMU FAR 0x0001ff497b7b11c0: a grey pixel).
+ 		 */
+ 		uint64_t take = s->allocSize + 64ull * s->bytesPerRow;
++		SURF_TRACE("pool alloc %llu\n", take);
+ 		uint64_t pa = topaz_gpu_pool_alloc(take, &va);
+ 		IOMemoryDescriptor *md = pa != 0 ? topaz_gpu_pool_md(pa, s->allocSize) : NULL;
++		SURF_TRACE("pool pa %#llx va %p md %p\n", pa, va, md);
+ 		if (md != NULL) {
+ 			s->poolSize = take;
+ 			for (uint64_t i = 0; i < take; i += 8) {
+ 				*(volatile uint64_t *)((uint8_t *)va + i) = 0;
+ 			}
++			SURF_TRACE("pool zeroed\n");
+ 			s->memory = md;
+ 			s->gpuPool = true;
+ 			s->scanoutPhys = pa;
+@@ -1087,7 +1105,9 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			 */
+ 			uint64_t take = gpu_low ? sweet_round_upage(s->allocSize + 64ull * s->bytesPerRow) : s->allocSize;
+ 			if (gpu_low) {
++				SURF_TRACE("res fill\n");
+ 				sweet_res_fill();
++				SURF_TRACE("res filled\n");
+ 				if (s->width >= 1000 && s->height >= 2000 && s->bytesPerElement == 4) {
+ 					mem = sweet_res_take(take);
+ 				}
+@@ -1102,6 +1122,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 				    kIODirectionInOut | kIOMemoryKernelUserShared, take, SWEET_UPAGE);
+ 			}
+ 		}
++		SURF_TRACE("memory %p\n", mem);
+ 		if (mem == NULL) {
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 			ret = kIOReturnNoMemory;
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 4e6441c..5eb355b 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -268,8 +268,10 @@ topaz_gpu_pool_alloc(uint64_t size, void **va)
+ 	unsigned c = (unsigned)((pa - gpu_pool_base) / GPU_POOL_CHUNK);
+ 	if (gpu_chunk_va[c] == NULL) {
+ 		/* in the kernel map, not the small IO submap ml_io_map uses (64 MB there failed) */
++		IOLog("TopazGPU: pool chunk %u mapping\n", c);
+ 		IOMemoryDescriptor *md = topaz_gpu_pool_md(gpu_pool_base + c * GPU_POOL_CHUNK, GPU_POOL_CHUNK);
+ 		IOMemoryMap *map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++		IOLog("TopazGPU: pool chunk %u at %#llx\n", c, map != NULL ? (unsigned long long)map->getVirtualAddress() : 0ull);
+ 		if (map != NULL) {
+ 			gpu_chunk_va[c] = (uint8_t *)map->getVirtualAddress();     /* (kept for good, with md) */
+ 		}
