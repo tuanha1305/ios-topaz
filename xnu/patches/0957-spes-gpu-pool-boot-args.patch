@@ -1,0 +1,85 @@
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 50131fa..4e6441c 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -159,11 +159,16 @@ kbuf_pa(struct kbuf *b, uint64_t off)
+  * reserved regions in the stock DT, not given to the kernel): a pool of it is
+  * the GPU's, mapped write-combined (Normal non-cacheable: no cache upkeep).
+  */
+-#define GPU_POOL_BASE       0x90000000ull
+-#define GPU_POOL_SIZE       0x40000000ull       /* 1 GB */
++#define GPU_POOL_MAX        0x40000000ull       /* 1 GB */
+ #define GPU_POOL_UNIT       0x10000ull          /* 64 KB */
+ #define GPU_POOL_CHUNK      0x4000000ull        /* 64 MB: mapped on first use (1 GB at once is more IO space than there is) */
+-#define GPU_POOL_CHUNKS     (GPU_POOL_SIZE / GPU_POOL_CHUNK)
++#define GPU_POOL_CHUNKS     (GPU_POOL_MAX / GPU_POOL_CHUNK)
++/*
++ * spes (no upper bank): the kernel's RAM starts at 0x80000000, so the pool has to be RAM the ADT
++ * leaves out: boot-args gpu_pool=ADDRESS gpu_pool_mb=N (below 4 GiB, 64 MB multiples, <= 1 GB).
++ */
++static uint64_t gpu_pool_base = 0x90000000ull;
++static uint64_t gpu_pool_size = GPU_POOL_MAX;
+ static uint8_t *gpu_chunk_va[GPU_POOL_CHUNKS];
+ static bool gpu_pool_ready;
+ static struct { uint64_t start, size; } pool_free[2048];
+@@ -251,8 +256,8 @@ topaz_gpu_pool_alloc(uint64_t size, void **va)
+ 	}
+ 	if (!gpu_pool_ready) {
+ 		/* one range per chunk, a unit short so that neighbours never merge: no buffer crosses a chunk */
+-		for (uint64_t c = 0; c < GPU_POOL_CHUNKS; c++) {
+-			range_free(pool_free, &pool_free_count, 2048, GPU_POOL_BASE + c * GPU_POOL_CHUNK, GPU_POOL_CHUNK - GPU_POOL_UNIT);
++		for (uint64_t c = 0; c < gpu_pool_size / GPU_POOL_CHUNK; c++) {
++			range_free(pool_free, &pool_free_count, 2048, gpu_pool_base + c * GPU_POOL_CHUNK, GPU_POOL_CHUNK - GPU_POOL_UNIT);
+ 		}
+ 		gpu_pool_ready = true;
+ 	}
+@@ -260,10 +265,10 @@ topaz_gpu_pool_alloc(uint64_t size, void **va)
+ 	if (pa == 0) {
+ 		return 0;
+ 	}
+-	unsigned c = (unsigned)((pa - GPU_POOL_BASE) / GPU_POOL_CHUNK);
++	unsigned c = (unsigned)((pa - gpu_pool_base) / GPU_POOL_CHUNK);
+ 	if (gpu_chunk_va[c] == NULL) {
+ 		/* in the kernel map, not the small IO submap ml_io_map uses (64 MB there failed) */
+-		IOMemoryDescriptor *md = topaz_gpu_pool_md(GPU_POOL_BASE + c * GPU_POOL_CHUNK, GPU_POOL_CHUNK);
++		IOMemoryDescriptor *md = topaz_gpu_pool_md(gpu_pool_base + c * GPU_POOL_CHUNK, GPU_POOL_CHUNK);
+ 		IOMemoryMap *map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
+ 		if (map != NULL) {
+ 			gpu_chunk_va[c] = (uint8_t *)map->getVirtualAddress();     /* (kept for good, with md) */
+@@ -276,7 +281,7 @@ topaz_gpu_pool_alloc(uint64_t size, void **va)
+ 		}
+ 	}
+ 	if (va != NULL) {
+-		*va = gpu_chunk_va[c] + (pa - GPU_POOL_BASE - c * GPU_POOL_CHUNK);
++		*va = gpu_chunk_va[c] + (pa - gpu_pool_base - c * GPU_POOL_CHUNK);
+ 	}
+ 	return pa;
+ }
+@@ -293,7 +298,7 @@ static void
+ pool_give_back(uint64_t pa, uint64_t size)
+ {
+ 	size = (size + GPU_POOL_UNIT - 1) & ~(GPU_POOL_UNIT - 1);
+-	if (pa >= GPU_POOL_BASE && pa + size <= GPU_POOL_BASE + GPU_POOL_SIZE) {
++	if (pa >= gpu_pool_base && pa + size <= gpu_pool_base + gpu_pool_size) {
+ 		range_free(pool_free, &pool_free_count, 2048, pa, size);
+ 	}
+ }
+@@ -1220,6 +1225,18 @@ topaz_adreno_init(void)
+ 	}
+ 	(void)PE_parse_boot_argn("gpu_identity", &gpu_identity, sizeof(gpu_identity));
+ 	(void)PE_parse_boot_argn("gpu_midmem", &gpu_midmem, sizeof(gpu_midmem));
++	uint64_t pool = 0;
++	uint32_t pool_mb = 0;
++	if (PE_parse_boot_argn("gpu_pool", &pool, sizeof(pool)) && pool != 0 && (pool & (GPU_POOL_CHUNK - 1)) == 0) {
++		gpu_pool_base = pool;
++	}
++	if (PE_parse_boot_argn("gpu_pool_mb", &pool_mb, sizeof(pool_mb)) && pool_mb >= 64 && pool_mb <= GPU_POOL_MAX >> 20) {
++		gpu_pool_size = ((uint64_t)pool_mb << 20) & ~(GPU_POOL_CHUNK - 1);
++	}
++	if (gpu_pool_base + gpu_pool_size > 0x100000000ull) {
++		gpu_pool_size = gpu_pool_base < 0x100000000ull ? (0x100000000ull - gpu_pool_base) & ~(GPU_POOL_CHUNK - 1) : 0;
++	}
++	IOLog("TopazGPU: pool %#llx-%#llx\n", gpu_pool_base, gpu_pool_base + gpu_pool_size);
+ 	if (PE_parse_boot_argn("gpu_mhz", &mhz, sizeof(mhz)) && mhz >= 300) {
+ 		core_mhz = mhz;                                 /* (checked against the OPP table in power_up) */
+ 	}
