@@ -4,11 +4,11 @@
 set -e
 VERSION=25.0.7
 SHA256=592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a6
-ROOT=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$(dirname "$0")/.." && pwd)              # userland/: mesa/*.patch, mesa/redwood-drm
 B=$ROOT/build-mesa
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 CC=$(xcrun --sdk iphoneos -f clang)
-cd "$B"
+mkdir -p "$B"; cd "$B"
 PATCHES=$(cat "$ROOT"/mesa/*.patch | shasum -a 256 | cut -d' ' -f1)
 if [ ! -d mesa-$VERSION ] || [ "$(cat mesa-$VERSION/.redwood-patches 2>/dev/null)" != "$PATCHES" ]; then
 	[ -f mesa-$VERSION.tar.xz ] || curl -sL --fail -o mesa-$VERSION.tar.xz https://archive.mesa3d.org/mesa-$VERSION.tar.xz

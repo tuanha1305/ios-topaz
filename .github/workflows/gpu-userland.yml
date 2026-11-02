@@ -31,15 +31,14 @@ jobs:
 
       - name: Mesa
         run: |
-          mkdir -p userland/mesa/build-mesa
-          bash userland/mesa/mk-mesa-mac.sh || { tail -60 userland/mesa/build-mesa/meson-setup.log userland/mesa/build-mesa/ninja.log; exit 1; }
+          bash userland/mesa/mk-mesa-mac.sh || { tail -60 userland/build-mesa/meson-setup.log userland/build-mesa/ninja.log; exit 1; }
 
       - name: libtopaz-gl, libtopaz-inject
         run: |
           set -x
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           CC="$(xcrun --sdk iphoneos -f clang) -target arm64-apple-ios16.0 -isysroot $SDK -O1 -Wall"
-          M=userland/mesa/build-mesa/out
+          M=userland/build-mesa/out
           mkdir -p obj/inc out
           # the iPhoneOS SDK links IOKit but has no headers for it: macOS's are the same interface
           ln -s "$(xcrun --sdk macosx --show-sdk-path)/System/Library/Frameworks/IOKit.framework/Headers" obj/inc/IOKit
