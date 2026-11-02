@@ -1,0 +1,47 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 65970f9..79f68c2 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -173,6 +173,23 @@ sweet_keys_init(void)
+ 	if (!pok && !gok) {
+ 		printf("SWEET KEYS: no readable keys; polling retained for recovery\n");
+ 	}
++	/*
++	 * spes: PM6125 LDOs (SID 0, peripherals 0x40.., L9 = 0x48 is the touch
++	 * vcc_i2c): subtype, STATUS1 (bit 7 ready), EN_CTL (bit 7 on) and the
++	 * arbiter owner. Read only.
++	 */
++	for (uint16_t per = 0x40; per <= 0x57; per++) {
++		uint16_t apid = keys_find_apid(per, count);
++		uint8_t st1 = 0, enc = 0, sub = 0;
++		bool a = keys_read(apid, (uint16_t)(per << 8 | 0x05), &sub);
++		bool b = keys_read(apid, (uint16_t)(per << 8 | 0x08), &st1);
++		bool c = keys_read(apid, (uint16_t)(per << 8 | 0x46), &enc);
++		if (apid != KEYS_NO_APID) {
++			printf("SWEET PMIC: L%u (0x%x) apid=%u owner=%u subtype=%#x/%d status1=%#x/%d en=%#x/%d\n",
++			    per - 0x40 + 1, per, apid, keys_rd(keys_cnfg, 0x700u + 4u * apid) & 7u,
++			    sub, a, st1, b, enc, c);
++		}
++	}
+ 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index b66e2db..b52ee32 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -679,6 +679,14 @@ touch_thread(void *arg, wait_result_t result)
+ 	touch_wait(20);
+ 	touch_gpio(TOUCH_PIN_RESET, 0, 3, 3, true, true);
+ 	touch_wait(250);
++	{
++		static const unsigned pins[] = { 98, 86, 80, 6, 7, 36 };
++		for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
++			vm_offset_t t = touch_tile(pins[i]);
++			printf("SWEET TOUCH: gpio%u cfg=%#x io=%#x\n", pins[i],
++			    touch_rd(t, TOUCH_GPIO_CFG(pins[i])), touch_rd(t, TOUCH_GPIO_IO(pins[i])));
++		}
++	}
+ 	st.stage = "probe";
+ 	uint8_t gid[32], legacy[32], fid1 = 0, fid2 = 0;
+ 	st.probing = true;
