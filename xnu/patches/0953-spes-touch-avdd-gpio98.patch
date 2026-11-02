@@ -1,0 +1,111 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 370d18b..b66e2db 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -28,6 +28,7 @@ void sweet_touch_init(void);
+ #define TOUCH_GCC_PA     0x01400000u
+ #define TOUCH_WEST_PA    0x00500000u /* TLMM 0x400000 + WEST tile: GPIO 6/7/80/86 */
+ #define TOUCH_EAST_PA    0x00d00000u /* TLMM 0x400000 + EAST tile: GPIO 36 */
++#define TOUCH_SOUTH_PA   0x00900000u /* TLMM 0x400000 + SOUTH tile: GPIO 98 (spes AVDD) */
+ #define TOUCH_GCC_VOTE   0x7900cu    /* QUP0 wrapper + SE2 vote, bits 0x13c0 */
+ #define TOUCH_RCG       0x1f3a8u    /* QUP0 S2 CMD; CFG +4, CBCR -4 (gcc-khaje.c) */
+ #define TOUCH_PIN_RESET  86u
+@@ -78,7 +79,8 @@ void sweet_touch_init(void);
+ #define SE_PACK1        0x000ffefeu
+ 
+ static struct {
+-	vm_offset_t se, gcc, west, east;
++	vm_offset_t se, gcc, west, east, south;
++	unsigned avdd, div;     /* spes: AVDD GPIO and raw-to-panel divisor (/4) */
+ 	bool started, dead, probing;
+ 	int kind, irq_hint;
+ 	uint32_t irq_status, irq_last, active;
+@@ -134,11 +136,14 @@ touch_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
+ 	return false;
+ }
+ 
+-/* topaz: GPIO 36 is on the EAST tile, the touch pins otherwise on WEST. */
++/*
++ * topaz: GPIO 36 is on the EAST tile, the touch pins otherwise on WEST.
++ * spes (Redmi Note 11, khaje-idp.dtsi): AVDD is GPIO 98, on SOUTH.
++ */
+ static vm_offset_t
+ touch_tile(unsigned pin)
+ {
+-	return pin == TOUCH_PIN_AVDD ? st.east : st.west;
++	return pin == 98u ? st.south : pin == TOUCH_PIN_AVDD ? st.east : st.west;
+ }
+ 
+ static void
+@@ -534,12 +539,15 @@ touch_focaltech(void)
+ 		}
+ 		unsigned px = ((unsigned)(p[0] & 15u) << 8) | p[1];
+ 		unsigned py = ((unsigned)(p[2] & 15u) << 8) | p[3];
+-		/* topaz: raw 0..1349 x 0..2999 (1.25x the panel) + 2-bit fractions */
+-		if (px > 1349 || py > 2999) {
++		/*
++		 * topaz: raw 0..1349 x 0..2999 (1.25x the panel) + 2-bit fractions.
++		 * boot-arg sweettouch_div (default 5, the topaz 5/4): 4 = raw is the panel.
++		 */
++		if (px >= 1080u * st.div / 4u || py >= 2400u * st.div / 4u) {
+ 			return EIO;
+ 		}
+-		px = (px * 4u + (p[4] >> 6)) / 5u;
+-		py = (py * 4u + ((p[4] >> 4) & 3u)) / 5u;
++		px = (px * 4u + (p[4] >> 6)) / st.div;
++		py = (py * 4u + ((p[4] >> 4) & 3u)) / st.div;
+ 		px = px > 1079 ? 1079 : px;
+ 		py = py > 2399 ? 2399 : py;
+ 		mask |= 1u << id;
+@@ -625,6 +633,17 @@ touch_thread(void *arg, wait_result_t result)
+ 	 * below hangs the SoC, the persistent log and the GUI got there first.
+ 	 */
+ 	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
++	st.avdd = TOUCH_PIN_AVDD;
++	(void)PE_parse_boot_argn("sweettouch_avdd", &st.avdd, sizeof(st.avdd));
++	st.div = 5;
++	(void)PE_parse_boot_argn("sweettouch_div", &st.div, sizeof(st.div));
++	if (st.div < 4u || st.div > 8u) {
++		st.div = 5;
++	}
++	if (st.avdd != TOUCH_PIN_AVDD && st.avdd != 98u) {
++		st.avdd = TOUCH_PIN_AVDD;
++	}
++	printf("SWEET TOUCH: AVDD GPIO %u, coordinates raw*4/%u\n", st.avdd, st.div);
+ 	printf("SWEET TOUCH: starting in %u s\n", delay_s);
+ 	touch_wait(delay_s * 1000u);
+ 	st.stage = "map";
+@@ -632,8 +651,9 @@ touch_thread(void *arg, wait_result_t result)
+ 	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x80000);
+ 	st.west = ml_io_map(TOUCH_WEST_PA, 0x58000);
+ 	st.east = ml_io_map(TOUCH_EAST_PA, 0x25000);
++	st.south = ml_io_map(TOUCH_SOUTH_PA, 0x63000);
+ 	st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
+-	if (!st.gcc || !st.west || !st.east || !st.se) {
++	if (!st.gcc || !st.west || !st.east || !st.south || !st.se) {
+ 		printf("SWEET TOUCH: MMIO mapping failed\n");
+ 		goto out;
+ 	}
+@@ -649,10 +669,10 @@ touch_thread(void *arg, wait_result_t result)
+ 	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x avdd=%#x\n",
+ 	    touch_rd(st.west, TOUCH_GPIO_IO(TOUCH_PIN_RESET)),
+ 	    touch_rd(st.west, TOUCH_GPIO_IO(TOUCH_PIN_IRQ)),
+-	    touch_rd(st.east, TOUCH_GPIO_IO(TOUCH_PIN_AVDD)));
++	    touch_rd(touch_tile(st.avdd), TOUCH_GPIO_IO(st.avdd)));
+ 	/* TopazTouch touch.c: IRQ input, AVDD on, I2C pins, then the reset pulse. */
+ 	touch_gpio(TOUCH_PIN_IRQ, 0, 3, 3, false, false);       /* CTL 0xc3 */
+-	touch_gpio(TOUCH_PIN_AVDD, 0, 3, 3, true, true);        /* CTL 0x2c3, high */
++	touch_gpio(st.avdd, 0, 3, 3, true, true);               /* CTL 0x2c3, high */
+ 	touch_gpio(6, 1, 0, 0, false, false);                   /* qup2 SDA, CTL 0x4 */
+ 	touch_gpio(7, 1, 0, 0, false, false);                   /* qup2 SCL */
+ 	touch_gpio(TOUCH_PIN_RESET, 0, 3, 3, true, false);      /* CTL 0x2c3, low */
+@@ -687,7 +707,8 @@ touch_thread(void *arg, wait_result_t result)
+ 	st.d_fid1 = fid1;
+ 	st.d_fid2 = fid2;
+ 	bool goodix = !ge && gid[0] == '9' && gid[1] == '8' && gid[2] == '9' && gid[3] == '6';
+-	bool fts = !fe1 && !fe2 && fid1 == 0x54 && fid2 == 0x52;
++	/* spes: any FocalTech answering at 0x38 (chip id printed above) */
++	bool fts = !fe1 && !fe2 && fid1 != 0x00 && fid1 != 0xff;
+ 	if (st.dead || goodix == fts) {
+ 		printf("SWEET TOUCH: no unique supported IC (goodix=%d fts=%d dead=%d); stopping\n",
+ 		    goodix, fts, st.dead);
