@@ -1,0 +1,18 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index b52ee32..9494aac 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -159,6 +159,13 @@ touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out,
+ 	}
+ 	cfg &= ~0x3ffu;
+ 	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
++	/*
++	 * spes: GPIO 98 has EGPIO_PRESENT (bit 11); without EGPIO_ENABLE (bit 12)
++	 * the pad stays with the island and ignores TLMM (Linux pinctrl-msm sets it).
++	 */
++	if (cfg & 0x800u) {
++		cfg |= 0x1000u;
++	}
+ 	touch_wr(tile, off, cfg);
+ }
+ 
