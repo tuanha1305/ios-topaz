@@ -1,0 +1,41 @@
+diff --git a/iokit/Kernel/arm/MiniIONetworkStack.cpp b/iokit/Kernel/arm/MiniIONetworkStack.cpp
+index 081fd35..f9e42aa 100644
+--- a/iokit/Kernel/arm/MiniIONetworkStack.cpp
++++ b/iokit/Kernel/arm/MiniIONetworkStack.cpp
+@@ -99,6 +99,11 @@ void
+ MiniIONetworkStackStart(void)
+ {
+ 	/* where the real one is: IOService:/IOResources/IONetworkStack */
++	static bool started;
++	if (started) {
++		return;
++	}
++	started = true;
+ 	IOService * resources = IOService::getResourceService();
+ 	IONetworkStack * stack = OSTypeAlloc(IONetworkStack);
+ 
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 8aa0c2f..864b29d 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -6386,6 +6386,7 @@ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
+ }
+ 
+ extern "C" void topaz_sta_init(void);
++extern "C" void MiniIONetworkStackStart(void);
+ 
+ extern "C" void
+ topaz_modem_init(void)
+@@ -6394,6 +6395,12 @@ topaz_modem_init(void)
+ 	uint32_t on = 0;
+ 	thread_t thread;
+ 
++	/*
++	 * spes: the stand-in IONetworkStack also without modem=1. configd's InterfaceNamer waits for
++	 * it before it says "*QUIET*"; without it every SCNetworkInterfaceCopyAll() (Settings at
++	 * launch, General > About for the MAC address) waited the namer's 5 minute timeout.
++	 */
++	MiniIONetworkStackStart();
+ 	if (started || !PE_parse_boot_argn("modem", &on, sizeof(on)) || on == 0) {
+ 		return;
+ 	}
